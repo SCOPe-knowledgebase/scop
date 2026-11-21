@@ -102,8 +102,8 @@ public class CheckPromoted {
 
     /**
        Check the two search indexes written at the end of promotion.  Do not
-       re-index an existing node: MakeIndex.indexNode is insert-only, and an
-       unnecessary API re-index deletes and rebuilds otherwise valid rows.
+       re-index an existing node: an unnecessary API re-index deletes and
+       rebuilds otherwise valid rows.
     */
     final private static void checkIndexes(Statement stmt,
                                            int nodeID,
@@ -111,11 +111,11 @@ public class CheckPromoted {
                                            int sunid,
                                            String label,
                                            boolean fix) throws Exception {
-        if (!hasRow(stmt,"select node_id from scop_index where node_id="+nodeID)) {
+        if (!hasRow(stmt,"select node_id from scop_index_node where node_id="+nodeID)) {
             System.out.println("missing search index for "+label);
             if (fix) {
                 MakeIndex.indexNode(nodeID);
-                if (hasRow(stmt,"select node_id from scop_index where node_id="+nodeID))
+                if (hasRow(stmt,"select node_id from scop_index_node where node_id="+nodeID))
                     System.out.println("  fixed");
                 else
                     System.out.println("  not fixed");

@@ -95,6 +95,13 @@ public class ChainDomainFatcatPair {
 
     // Gap data
     public ArrayList<ChainDomainFatcatPair.Gap> chainGaps;
+    // alignment rows of the .aln and the RAF positions derived from them
+    ArrayList<ChainDomainRafPositions.Row> alnRows = new ArrayList<ChainDomainRafPositions.Row>();
+    ChainDomainRafPositions.Result rafPositions;
+    String domainDescription;
+    /** Residue letters in a FATCAT row that disagree with the RAF, above
+     *  which the comparison is failed rather than stored. */
+    static final int MAX_RAF_MISMATCHES = 0;
     public ArrayList<ChainDomainFatcatPair.Gap> domainGaps;
 
     String alignmentFile;
@@ -114,7 +121,14 @@ public class ChainDomainFatcatPair {
     static Pattern pAlign2 = Pattern.compile(align2); // ini_len, ini_rmsd, opt_equ, opt_rmsd, chain_rmsd, score, align_len, gaps
     static String align3 = "P-value ([0-9]+.[0-9]+e[+-]*[0-9]+) Afp-num (\\d+) Identity (\\d+\\.\\d+)% Similarity (\\d+\\.\\d+)%";
     static Pattern pAlign3 = Pattern.compile(align3); // p-val, afp_num, identity, similarity
-    static String alignIndex = "Chain \\d+:\\s+(-*\\d+[A-Z]*) [-\\w]+";
+    // PDB residue numbers may carry an insertion code; the ASTRAL chain files
+    // and RAF records keep the code in the case the PDB entry used, so
+    // accept lowercase codes (e.g. 52a) as well as uppercase (e.g. 30C).
+    // FATCAT prints the residue id in a 5-character field, so a 4-digit
+    // number with an insertion code (e.g. 1541A) fills it and no blank
+    // separates it from the colon ("Chain 1:1541A ..."); the blank is
+    // therefore optional.
+    static String alignIndex = "Chain \\d+:\\s*(-*\\d+[A-Za-z]*) [-\\w]+";
     static Pattern pAlignIndex = Pattern.compile(alignIndex);
 
     static String alignDomainRange = "([A-Za-z0-9]):(?:\\d+(?:-(\\d+))?)?";
@@ -290,6 +304,7 @@ public class ChainDomainFatcatPair {
             this.domainRafBody = RAF.getRAFBody(rs.getString(2));
 
             String description = rs.getString(3);
+            this.domainDescription = description;
             Matcher m = pAlignDomainRange.matcher(description);
             if (m.find()) { // e.g. 1hqc A:243-318
                 if (m.groupCount() == 3) {
@@ -815,6 +830,13 @@ public class ChainDomainFatcatPair {
         this.chainSeq += new String(chain_line_arr).substring(14).trim();
         this.alnSeq += line2.substring(14);
         this.domainSeq += new String(domain_line_arr).substring(14).trim();
+        ChainDomainRafPositions.Row row = new ChainDomainRafPositions.Row();
+        row.chainId = chain_start;
+        row.domainId = domain_start;
+        row.chainText = chain_line.length() > 14 ? chain_line.substring(14) : "";
+        row.domainText = domain_line.length() > 14 ? domain_line.substring(14) : "";
+        row.marks = line2.length() > 14 ? line2.substring(14) : "";
+        alnRows.add(row);
 
     }
 
@@ -1613,6 +1635,34 @@ public class ChainDomainFatcatPair {
                hasUsableTransform;
     }
 
+    /** Derive the RAF positions and gaps of the alignment from the .aln
+     *  rows, and fill the pre-November-2026 columns from them. */
+    public void deriveRafPositions() throws Exception {
+        int[] range = ChainDomainRafPositions.domainRange(domainRafBody, domainDescription);
+        if (fcs != null && fcs.chainResidues == null)
+            fcs.chainResidues = ChainDomainRafPositions.fileResidues(Paths.get(chainFile));
+        ArrayList<String[]> chainRes = (fcs != null ? fcs.chainResidues :
+            ChainDomainRafPositions.fileResidues(Paths.get(chainFile)));
+        ArrayList<String[]> domainRes = ChainDomainRafPositions.fileResidues(Paths.get(domainFile));
+        rafPositions = ChainDomainRafPositions.derive(chainRafBody, chainRes, domainRafBody, domainRes,
+                                                      range[0], range[1], alnRows);
+        int mismatches = rafPositions.chainMismatches + rafPositions.domainMismatches;
+        if (mismatches > MAX_RAF_MISMATCHES)
+            throw new Exception(mismatches + " residue letters of the FATCAT alignment of " +
+                                chain + " x " + domain + " disagree with the RAF");
+        if (rafPositions.hasAlignment()) {
+            chain_alignment_start = RAF.getResID(chainRafBody, rafPositions.chainStart);
+            chain_alignment_length = rafPositions.chainEnd - rafPositions.chainStart + 1;
+            domain_alignment_start = RAF.getResID(domainRafBody, rafPositions.domainStart);
+            domain_alignment_length = rafPositions.domainEnd - rafPositions.domainStart + 1;
+        } else {
+            chain_alignment_start = null;
+            chain_alignment_length = null;
+            domain_alignment_start = null;
+            domain_alignment_length = null;
+        }
+    }
+
     public void storeSQL() throws Exception {
 
         java.util.function.Function<Integer, String> sqlInt =
@@ -1625,15 +1675,28 @@ public class ChainDomainFatcatPair {
                 v -> (v == null || v.equals("NULL")) ? "NULL" : "'" + v + "'";
 
         boolean retained=isRetained();
-        String chainSHA = (fcs==null ? null : fcs.chainChecksum);
-        String domainSHA = (fcs==null ? null :
-            MakeChainPDB.sha256(Paths.get(domainFile)));
+        Integer legacyHitId = (fcs==null ? null : fcs.legacyHitIds.get(domain_id));
+        if (legacyHitId != null) {
+            SQLWriter.write("DELETE FROM scop_node_fatcat_chain_gap WHERE hit_id=" + legacyHitId + ";\n" +
+                            "DELETE FROM scop_node_fatcat_chain_matrix WHERE hit_id=" + legacyHitId + ";\n" +
+                            "DELETE FROM scop_node_fatcat_chain WHERE id=" + legacyHitId + ";\n");
+            logger.info("legacy hit " + legacyHitId + " for " + chain + " x " + domain +
+                        " replaced; recomputed hit is " + (retained ? "retained" : "rejected"));
+        }
+        // The checksum of the chain file is in astral_chain_stable_binding
+        // and is verified before the run; that of the domain file is kept
+        // once per run and domain.
+        String domainChecksumSQL = "";
+        if (fcs!=null && fcs.run_id>0)
+            domainChecksumSQL = "INSERT IGNORE INTO scop_node_fatcat_chain_domain_coordinate " +
+                "(run_id,node_id,coordinate_sha256,n_pairs) VALUES ("+fcs.run_id+","+domain_id+",'"+
+                MakeChainPDB.sha256(Paths.get(domainFile))+"',0);\n";
         if (fcs!=null && fcs.run_id>0 && !retained) {
-            SQLWriter.write("INSERT INTO scop_node_fatcat_chain_completion " +
-                "(run_id,chain_id,node_id,chain_coordinate_sha256,"+
-                "domain_coordinate_sha256,status,result_id,p_val,ini_rmsd,completed_at) VALUES ("+
-                fcs.run_id+","+chain_id+","+domain_id+",'"+chainSHA+"','"+
-                domainSHA+"','complete_rejected',NULL,"+sqlDouble.apply(p_val)+","+
+            SQLWriter.write(domainChecksumSQL +
+                "INSERT INTO scop_node_fatcat_chain_completion " +
+                "(run_id,chain_id,node_id,status,result_id,p_val,ini_rmsd,completed_at) VALUES ("+
+                fcs.run_id+","+chain_id+","+domain_id+
+                ",'complete_rejected',NULL,"+sqlDouble.apply(p_val)+","+
                 sqlDouble.apply(ini_rmsd)+",NOW()) ON DUPLICATE KEY UPDATE " +
                 "status=VALUES(status),p_val=VALUES(p_val),ini_rmsd=VALUES(ini_rmsd),"+
                 "completed_at=VALUES(completed_at);\n");
@@ -1642,8 +1705,10 @@ public class ChainDomainFatcatPair {
         }
 
         String stmt1 =
-                "INSERT INTO scop_node_fatcat_chain VALUES (" +
-                        "NULL, " +
+                "INSERT INTO scop_node_fatcat_chain (chain_id, domain_id, chain_len, domain_len, " +
+                        "ini_len, ini_rmsd, opt_equ, opt_rmsd, chain_rmsd, score, align_len, gaps, " +
+                        "p_val, afp_num, pct_identical, similarity, chain_start, chain_end, " +
+                        "domain_start, domain_end) VALUES (" +
                         sqlInt.apply(chain_id) + ", " +
                         sqlInt.apply(domain_id) + ", " +
                         sqlInt.apply(chain_len) + ", " +
@@ -1660,44 +1725,26 @@ public class ChainDomainFatcatPair {
                         sqlInt.apply(afp_num) + ", " +
                         sqlDouble.apply(identity) + ", " +
                         sqlDouble.apply(similarity) + ", " +
-                        sqlString.apply(chain_alignment_start) + ", " +
-                        sqlInt.apply(chain_alignment_length) + ", " +
-                        sqlString.apply(domain_alignment_start) + ", " +
-                        sqlInt.apply(domain_alignment_length) +
+                        sqlInt.apply(rafPositions == null ? null : rafPositions.chainStart) + ", " +
+                        sqlInt.apply(rafPositions == null ? null : rafPositions.chainEnd) + ", " +
+                        sqlInt.apply(rafPositions == null ? null : rafPositions.domainStart) + ", " +
+                        sqlInt.apply(rafPositions == null ? null : rafPositions.domainEnd) +
                         ");";
 
         String auto_id = "SET @hit_id = LAST_INSERT_ID();";
 
+        ArrayList<ChainDomainRafPositions.Gap> gaps =
+            (rafPositions == null ? new ArrayList<ChainDomainRafPositions.Gap>() : rafPositions.gaps);
         StringBuilder sb = new StringBuilder();
         sb.append("INSERT INTO scop_node_fatcat_chain_gap ");
-        sb.append("(hit_id, gap_start_chain, gap_length_chain, gap_start_domain, gap_length_domain, gap_id, gap_type) VALUES\n");
-
-        for (int n = 0; n < chainGaps.size(); n++) {
-
-            String gap_start_chain = sqlString.apply(chainGaps.get(n).gap_start);
-            String gap_start_domain = sqlString.apply(domainGaps.get(n).gap_start);
-
-            String gap_length_chain = sqlInt.apply(chainGaps.get(n).len);
-            String gap_length_domain = sqlInt.apply(domainGaps.get(n).len);
-
-            String gap_id = sqlInt.apply(chainGaps.get(n).gap_id);
-            String gap_type = sqlInt.apply(chainGaps.get(n).gap_type);
-
-            sb.append("(@hit_id, ")
-                    .append(gap_start_chain).append(", ")
-                    .append(gap_length_chain).append(", ")
-                    .append(gap_start_domain).append(", ")
-                    .append(gap_length_domain).append(", ")
-                    .append(gap_id).append(", ")
-                    .append(gap_type).append(")");
-
-            if (n < chainGaps.size() - 1) {
-                sb.append(",\n");
-            } else {
-                sb.append(";");
-            }
+        sb.append("(hit_id, gap_id, gap_type, gap_start_chain, gap_end_chain, gap_start_domain, gap_end_domain) VALUES\n");
+        for (int n = 0; n < gaps.size(); n++) {
+            ChainDomainRafPositions.Gap g = gaps.get(n);
+            String sep = (n < gaps.size() - 1) ? ",\n" : ";";
+            sb.append("(@hit_id, ").append(g.gapId).append(", ").append(g.gapType).append(", ")
+                    .append(sqlInt.apply(g.chainStart)).append(", ").append(sqlInt.apply(g.chainEnd)).append(", ")
+                    .append(sqlInt.apply(g.domainStart)).append(", ").append(sqlInt.apply(g.domainEnd)).append(")").append(sep);
         }
-
         String stmt2 = sb.toString();
 
         sb = new StringBuilder();
@@ -1720,13 +1767,13 @@ public class ChainDomainFatcatPair {
         String stmt3 = sb.toString();
 
         String sql = stmt1 + "\n" + auto_id + "\n" +
-            (chainGaps.size()>0 ? stmt2+"\n" : "") + stmt3 + "\n";
+            (gaps.size()>0 ? stmt2+"\n" : "") + stmt3 + "\n";
         if (fcs!=null && fcs.run_id>0)
-            sql += "INSERT INTO scop_node_fatcat_chain_completion " +
-                "(run_id,chain_id,node_id,chain_coordinate_sha256,"+
-                "domain_coordinate_sha256,status,result_id,p_val,ini_rmsd,completed_at) VALUES ("+
-                fcs.run_id+","+chain_id+","+domain_id+",'"+chainSHA+"','"+
-                domainSHA+"','complete_retained',@hit_id,"+sqlDouble.apply(p_val)+","+
+            sql += domainChecksumSQL +
+                "INSERT INTO scop_node_fatcat_chain_completion " +
+                "(run_id,chain_id,node_id,status,result_id,p_val,ini_rmsd,completed_at) VALUES ("+
+                fcs.run_id+","+chain_id+","+domain_id+
+                ",'complete_retained',@hit_id,"+sqlDouble.apply(p_val)+","+
                 sqlDouble.apply(ini_rmsd)+",NOW()) ON DUPLICATE KEY UPDATE " +
                 "status=VALUES(status),result_id=VALUES(result_id),p_val=VALUES(p_val),"+
                 "ini_rmsd=VALUES(ini_rmsd),completed_at=VALUES(completed_at);\n";
@@ -1842,8 +1889,11 @@ public class ChainDomainFatcatPair {
             if (storeResult) this.storeSQL();
             return;
         }
-        this.constructNewSeqs();
-        this.parseGaps();
+        // The position derivation is only needed when the result is stored;
+        // an archive-only rebuild just needs the FATCAT output files.
+        if (storeResult) {
+            this.deriveRafPositions();
+        }
 
         if (this.fcs != null) {
             this.archiveAndClear();

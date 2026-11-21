@@ -33,9 +33,19 @@ import org.strbio.IO;
 import gov.lbl.scop.local.LocalSQL;
 
 /**
-   Generates full-text index to search SCOP.
+   Generates the text index used to search SCOP: scop_index_text holds
+   each distinct pair of search terms once, and scop_index_node gives
+   the text of each node (most nodes keep their text from one release
+   to the next).
 */
 public class MakeIndex {
+    /**
+       SQL for the key of a text in scop_index_text: md5 of the short
+       term, a NUL and the long term, in the table's character set.
+       Takes the short and long terms as parameters.
+    */
+    final private static String TEXT_MD5 = "unhex(md5(concat(convert(? using latin1), char(0), convert(? using latin1))))";
+
     /**
        index a given node
     */
@@ -168,11 +178,26 @@ public class MakeIndex {
         }
         rs.close();
 
-        shortKeys = StringUtil.replace(shortKeys,"\"","\\\"");
-        longKeys = StringUtil.replace(longKeys,"\"","\\\"");
         // System.out.println(shortKeys);
-        stmt.executeUpdate("insert into scop_index values ("+nodeID+", \""+shortKeys+"\", \""+longKeys+"\")");
         stmt.close();
+
+        // each distinct text is stored once, under a hash of both terms as stored
+        PreparedStatement ps = LocalSQL.prepareStatement("insert into scop_index_text (text_md5, short_term, long_term) values ("+TEXT_MD5+", ?, ?) on duplicate key update id=id");
+        ps.setString(1, shortKeys);
+        ps.setString(2, longKeys);
+        ps.setString(3, shortKeys);
+        ps.setString(4, longKeys);
+        ps.executeUpdate();
+        ps.close();
+
+        // a node has one text; indexing it again replaces the link
+        ps = LocalSQL.prepareStatement("replace into scop_index_node (node_id, release_id, text_id) select n.id, n.release_id, t.id from scop_node n, scop_index_text t where n.id=? and t.text_md5="+TEXT_MD5);
+        ps.setInt(1, nodeID);
+        ps.setString(2, shortKeys);
+        ps.setString(3, longKeys);
+        if (ps.executeUpdate() == 0)
+            throw new Exception("no search index text stored for node "+nodeID);
+        ps.close();
     }
 
     /**
@@ -182,15 +207,16 @@ public class MakeIndex {
         LocalSQL.connectRW();
         Statement stmt = LocalSQL.createStatement();
         ResultSet rs;
-        stmt.executeUpdate("truncate table scop_index");
-        stmt.executeUpdate("alter table scop_index disable keys");
+        stmt.executeUpdate("truncate table scop_index_node");
+        stmt.executeUpdate("truncate table scop_index_text");
+        stmt.executeUpdate("alter table scop_index_text disable keys");
         rs = stmt.executeQuery("select id from scop_node where level_id>1");
         while (rs.next()) {
             int nodeID = rs.getInt(1);
             indexNode(nodeID);
         }
         rs.close();
-        stmt.executeUpdate("alter table scop_index enable keys");
+        stmt.executeUpdate("alter table scop_index_text enable keys");
         stmt.close();
     }
     

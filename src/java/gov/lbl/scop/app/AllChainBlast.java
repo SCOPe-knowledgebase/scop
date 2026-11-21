@@ -1,5 +1,23 @@
 /*
  * Software to build and maintain SCOPe, https://scop.berkeley.edu/
+ *
+ * Copyright (C) 2026 The Regents of the University of California
+ *
+ * For feedback, mailto:scope@compbio.berkeley.edu
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * Version 2.1 of the License, or (at your option) any later version.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301
+ * USA
  */
 package gov.lbl.scop.app;
 
@@ -224,6 +242,47 @@ public class AllChainBlast {
                 oldQuery+")");
         }
         stmt.close();
+    }
+
+    /**
+       After candidates have been appended to a validated population
+       (ExtendAllChainPopulation), rebuild its "all" database and queue a
+       search of it for every sequence that has not been searched.
+       Sequences already in the population are not searched again.
+       Returns the number of searches queued.
+    */
+    public static int queueAdded(int populationID) throws Exception {
+        Statement stmt=LocalSQL.createStatement();
+        String unsearched="from astral_chain_all_candidate c where c.population_id="+
+            populationID+" and not exists (select 1 from astral_chain_all_blast_coverage v "+
+            "where v.population_id=c.population_id and v.query_seq_id=c.seq_id)";
+        ResultSet rs=stmt.executeQuery("select count(distinct c.seq_id) "+unsearched);
+        rs.next(); int added=rs.getInt(1); rs.close();
+        if (added==0) { stmt.close(); return 0; }
+
+        // the database files are replaced in place
+        rs=stmt.executeQuery("select count(*) from astral_chain_all_blast_coverage where "+
+            "population_id="+populationID+" and status in ('queued','running')");
+        rs.next(); int active=rs.getInt(1); rs.close();
+        if (active!=0) throw new Exception(active+" BLAST searches of population "+
+            populationID+" are queued or running");
+        rs=stmt.executeQuery("select fasta_path from astral_chain_all_blast_database where "+
+            "population_id="+populationID+" and kind='all'");
+        if (!rs.next()) throw new Exception("population "+populationID+" has no BLAST database");
+        Path all=Paths.get(rs.getString(1)); rs.close();
+
+        String[] executables=configureExecutables();
+        int methodID=methodID(stmt);
+        writeFasta(stmt,populationID,false,all);
+        Blast formatter=new Blast("2.2.18");
+        formatter.baseDir=all.getParent().toFile(); formatter.formatDB(all.toString());
+        verifyFormattedDatabase(all);
+        int allID=addDatabase(stmt,populationID,"all",all,executables[1]);
+        int queued=stmt.executeUpdate("insert ignore into astral_chain_all_blast_coverage " +
+            "(population_id,method_id,database_id,query_seq_id,status) " +
+            "select distinct "+populationID+","+methodID+","+allID+",c.seq_id,'queued' "+
+            unsearched);
+        stmt.close(); return queued;
     }
 
     private static void verifyFormattedDatabase(Path fasta) throws Exception {

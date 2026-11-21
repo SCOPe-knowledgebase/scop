@@ -87,8 +87,9 @@ public class FatcatPair {
     double[][] rotLst;
     double[] transLst;
 
-    public ArrayList<Gap> queryGaps;
-    public ArrayList<Gap> hitGaps;
+    /** positions and gaps of a retained hit: model side as 0-indexed residue
+     *  positions (residue number - 1), domain side as 0-indexed RAF positions */
+    public ChainDomainRafPositions.Result rafPositions;
 
     String fatcatSeq; // sequence fatcat reads from the domain
     String rafSeq; // sequence of the domain from raf
@@ -169,8 +170,7 @@ public class FatcatPair {
         this.transLst = new double[3];
 
         // gap information for both the query pdb and hit scop domain
-        this.queryGaps = new ArrayList<>();
-        this.hitGaps = new ArrayList<>();
+        this.rafPositions = null;
 
         // progress checks
         this.comparison_completed = false;
@@ -246,8 +246,7 @@ public class FatcatPair {
         this.transLst = new double[3];
 
         // gap information for both the query pdb and hit scop domain
-        this.queryGaps = new ArrayList<>();
-        this.hitGaps = new ArrayList<>();
+        this.rafPositions = null;
 
         // progress checks
         this.comparison_completed = false;
@@ -508,9 +507,14 @@ public class FatcatPair {
 
     public void storeSQL() throws Exception {
 
-        // stmt1 (scop_node_fatcat_af)
+        boolean detail = shouldStoreDetail() && rafPositions != null && rafPositions.hasAlignment();
+
+        // stmt1 (scop_node_fatcat_af); the domain positions are stored for retained hits only
         String stmt1 = String.format(
-                "INSERT INTO scop_node_fatcat_af VALUES (NULL, %d, %d, %d, %d, %d, %.6f, %d, %.6f, %.6f, %.6f, %d, %d, %s, %d, %.6f, %.6f, %d, %d, '%s', %d);",
+                "INSERT INTO scop_node_fatcat_af (af_id, node_id, af_len, scop_len, ini_len, ini_rmsd, opt_equ, opt_rmsd, " +
+                "chain_rmsd, score, align_len, gaps, p_val, afp_num, identity, similarity, af_start, af_length, " +
+                "domain_start, domain_end) VALUES " +
+                "(%d, %d, %d, %d, %d, %.6f, %d, %.6f, %.6f, %.6f, %d, %d, %s, %d, %.6f, %.6f, %d, %d, %s, %s);",
                 query_id,
                 node_id,
                 af_len,
@@ -529,41 +533,32 @@ public class FatcatPair {
                 similarity,
                 af_start,
                 af_length,
-                scop_start,
-                scop_length
+                detail ? String.valueOf(rafPositions.domainStart) : "NULL",
+                detail ? String.valueOf(rafPositions.domainEnd) : "NULL"
         );
 
         String detailSQL = "";
-        if (shouldStoreDetail()) {
+        if (detail) {
             // store auto-incremented id from scop_node_fatcat_af insertion
             String auto_id = "SET @hit_id = LAST_INSERT_ID();";
 
-            // stmt2 (scop_node_fatcat_af_gap)
+            // stmt2 (scop_node_fatcat_af_gap): model residue numbers, domain RAF positions
             StringBuilder sb = new StringBuilder();
-            if (!queryGaps.isEmpty()) {
+            if (!rafPositions.gaps.isEmpty()) {
                 sb.append("INSERT INTO scop_node_fatcat_af_gap ");
-                sb.append("(hit_id, gap_start_af, gap_length_af, gap_start_scop, gap_length_scop, gap_id, gap_type) VALUES\n");
-                for (int n = 0; n < queryGaps.size(); n++) {
-                    int gap_start_af = queryGaps.get(n).start;
-                    int gap_length_af = queryGaps.get(n).len;
-                    int gap_start_scop = hitGaps.get(n).start;
-                    int gap_length_scop = hitGaps.get(n).len;
-                    int gap_id = queryGaps.get(n).gap_id;
-                    int gap_type = queryGaps.get(n).gap_type;
+                sb.append("(hit_id, gap_id, gap_type, gap_start_af, gap_end_af, gap_start_domain, gap_end_domain) VALUES\n");
+                for (int n = 0; n < rafPositions.gaps.size(); n++) {
+                    ChainDomainRafPositions.Gap g = rafPositions.gaps.get(n);
                     sb.append(String.format(
-                            "(@hit_id, %d, %d, %d, %d, %d, %d)",
-                            gap_start_af,
-                            gap_length_af,
-                            gap_start_scop,
-                            gap_length_scop,
-                            gap_id,
-                            gap_type
+                            "(@hit_id, %d, %d, %s, %s, %s, %s)",
+                            g.gapId,
+                            afGapType(g.gapType),
+                            g.chainStart == null ? "NULL" : String.valueOf(g.chainStart + 1),
+                            g.chainEnd == null ? "NULL" : String.valueOf(g.chainEnd + 1),
+                            g.domainStart == null ? "NULL" : String.valueOf(g.domainStart),
+                            g.domainEnd == null ? "NULL" : String.valueOf(g.domainEnd)
                     ));
-                    if (n < queryGaps.size() - 1) {
-                        sb.append(",\n");
-                    } else {
-                        sb.append(";");
-                    }
+                    sb.append(n < rafPositions.gaps.size() - 1 ? ",\n" : ";");
                 }
             }
             String stmt2 = sb.toString();
@@ -594,92 +589,6 @@ public class FatcatPair {
         this.sql = stmt1 + "\n" + detailSQL;
         SQLWriter.write(sql);
         SQLWriter.flush();
-    }
-
-    /*
-    Store the instance variables / FATCAT values into SQL tables
-     */
-    public void storeData() throws Exception {
-
-        LocalSQL.connectRW();
-        logger.info("storeData");
-
-        // set id
-        stmt1.setInt(1, this.query_id);
-        stmt1.setInt(2, this.node_id);
-        stmt1.setInt(3, this.af_len);
-        stmt1.setInt(4, this.scop_len);
-        stmt1.setInt(5, this.ini_len);
-        stmt1.setDouble(6, this.ini_rmsd);
-        stmt1.setInt(7, this.opt_equ);
-        stmt1.setDouble(8, this.opt_rmsd);
-        stmt1.setDouble(9, this.chain_rmsd);
-        stmt1.setDouble(10, this.score);
-        stmt1.setInt(11, this.align_len);
-        stmt1.setInt(12, this.gaps);
-        stmt1.setDouble(13, this.p_val);
-        stmt1.setInt(14, this.afp_num);
-        stmt1.setDouble(15, this.identity);
-        stmt1.setDouble(16, this.similarity);
-        stmt1.setInt(17, this.af_start);
-        stmt1.setInt(18, this.af_length);
-        stmt1.setString(19, this.scop_start);
-        stmt1.setInt(20, this.scop_length);
-
-        logger.info("executing stmt1");
-        // add batch
-        stmt1.executeUpdate();
-
-        // get auto-incremented id from the scop_node_fatcat_af entry
-        ResultSet generatedKeys = stmt1.getGeneratedKeys();
-        int hit_id = -1;
-        if (generatedKeys.next()) {
-            hit_id = generatedKeys.getInt(1);
-        }
-        generatedKeys.close();
-
-        if (!shouldStoreDetail()) {
-            return;
-        }
-
-        // Insert into scop_node_fatcat_af_gap
-        logger.info("adding stmt2 batches");
-        for (int n = 0; n < queryGaps.size(); n++) {
-            int gap_start_af = queryGaps.get(n).start;
-            int gap_length_af = queryGaps.get(n).len;
-            int gap_start_scop = hitGaps.get(n).start;
-            int gap_length_scop = hitGaps.get(n).len;
-            int gap_id = queryGaps.get(n).gap_id;
-            int gap_type = queryGaps.get(n).gap_type;
-
-            stmt2.setInt(1, hit_id);
-            stmt2.setInt(2, gap_start_af);
-            stmt2.setInt(3, gap_length_af);
-            stmt2.setInt(4, gap_start_scop);
-            stmt2.setInt(5, gap_length_scop);
-            stmt2.setInt(6, gap_id);
-            stmt2.setInt(7, gap_type);
-
-            stmt2.addBatch();
-        }
-         stmt2.executeBatch();
-
-        // Insert into scop_node_fatcat_af_matrix
-        logger.info("adding stmt3 batch");
-        stmt3.setInt(1, hit_id);
-        int k = 2;
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                stmt3.setDouble(k, rotLst[i][j]);
-                k++;
-            }
-        }
-        for (int m = 0; m < 3; m++) {
-            stmt3.setDouble(k, transLst[m]);
-            k++;
-        }
-        stmt3.addBatch();
-        stmt3.executeBatch();
     }
 
     /*
@@ -806,382 +715,6 @@ public class FatcatPair {
         this.scop_length = scop_index - scop_start_index;
     }
 
-    /*
-    execute alignment against fatcatSeq, insert gaps ("-"), missing residues (","), insertions ("/") and post-translational modifications ("?")
-    accordingly, such that fatcatSeq matches in length one-to-one with the FULL rafMap, but with "-" gaps where an alignment did not occur.
-     */
-    public void constructNewSeqs() throws Exception {
-
-        logger.info("constructNewSeqs");
-
-        getRafSeq();
-        String[] rafMapArray = fcs.rafMap.values().toArray(new String[0]);
-
-        if (shortMatch) {
-            this.af_len = (int) Files.lines(Paths.get(this.afFile))
-                    .filter(line -> line.startsWith("ATOM"))
-                    .map(line -> line.substring(21, 26).trim())
-                    .distinct()
-                    .count();
-            this.scop_len = fcs.rafMap.size();
-            this.gaps = Math.max(this.scop_len, this.af_len);
-
-            int af_idx = 0;
-            int scop_idx = 0;
-
-            // build overlapping gap region
-            while (af_idx < af_len && scop_idx < scop_len) {
-                afSeq += "X";
-                alnSeq += " ";
-                scopSeq += rafMapArray[scop_idx].toUpperCase();
-                af_idx++;
-                scop_idx++;
-            }
-
-            // build the rest of the alphafold if its longer
-            while (af_idx < af_len) {
-                afSeq += "X";
-                alnSeq += " ";
-                scopSeq += "=";
-                af_idx++;
-            }
-
-            // build the rest of the scop if its longer
-            while (scop_idx < scop_len) {
-                afSeq += "=";
-                alnSeq += " ";
-                scopSeq += rafMapArray[scop_idx].toUpperCase();
-                scop_idx++;
-            }
-            return;
-        }
-
-        this.scopSeq = this.scopSeq.replaceAll("-", "=");
-        this.afSeq = this.afSeq.replaceAll("-", "=");
-
-        // run rafSeq x scopSeq alignment
-        logger.info("running alignment " + this.rafSeq + " " + this.scopSeq);
-        Protein rafSeq_obj = new Protein(this.rafSeq);
-        Protein scopSeq_obj = new Protein(this.scopSeq);
-
-        AlignmentParameters ap = new AlignmentParameters(new GapAffine(0.5, 0.0), new ScoreList(new ScoreID()));
-        Alignment aln = rafSeq_obj.getGlobalAlignment(scopSeq_obj, ap, null);
-        if (aln == null) {
-            throw new Exception("Sequence alignment rafSeq x scopSeq failed for " + this.scopFile);
-        }
-        char[][] alignedArrays = aln.toCharArrays();
-        String rafSeqAligned = new String(alignedArrays[0]); // rafSeq
-        String scopSeqAligned = new String(alignedArrays[1]); // scopSeq
-
-        // go index by index through rafSeqAligned, scopSeqAligned, afSeq, alnSeq
-        logger.info("constructing seqs");
-        String af_prefix = "";
-        String aln_prefix = "";
-        String scop_prefix = "";
-
-        // beginning gap
-        int idx_af = 1; 
-        int idx_scop = 1;
-
-        int idx_raf = 0;
-
-        int dist_to_scop_start = new ArrayList<>(fcs.rafMap.keySet()).indexOf(String.valueOf(scop_start));
-        int dist_to_af_start = af_start - idx_af;
-
-        rafMapArray = fcs.rafMap.values().toArray(new String[0]);
-
-        // adjust if scop is longer than af
-        while (dist_to_scop_start > dist_to_af_start) {
-            af_prefix += "=";
-            aln_prefix += " ";
-            scop_prefix += rafMapArray[idx_raf].toUpperCase();
-            idx_raf++;
-            dist_to_scop_start--;
-        }
-
-        // adjust if af is longer than scop
-        while (dist_to_scop_start < dist_to_af_start) {
-            af_prefix += "B";
-            aln_prefix += " ";
-            scop_prefix += "=";
-            dist_to_af_start--;
-            idx_af++;
-        }
-
-        // bring both to starts
-        assert dist_to_af_start == dist_to_scop_start;
-        while (dist_to_scop_start > 0) {
-            af_prefix += "B";
-            aln_prefix += " ";
-            scop_prefix += rafMapArray[idx_raf].toUpperCase();
-            idx_raf++;
-            dist_to_scop_start--;
-            idx_af++;
-        }
-
-        // middle portion
-        StringBuilder sbAf = new StringBuilder(afSeq);
-        StringBuilder sbAln = new StringBuilder(alnSeq);
-        StringBuilder sbScop = new StringBuilder(scopSeqAligned);
-
-        for (int i = 0; i < scopSeqAligned.length(); i++) {
-            // the regular alignment is already there, just adding in hetatm's / missings / insertions
-
-            char c_raf = rafSeqAligned.charAt(i);
-            char c_scop = scopSeqAligned.charAt(i);
-
-            // missing residues
-            if (c_raf == ',') {
-                if (c_scop == '=') {
-                    sbScop.setCharAt(i, ',');
-                } else if (c_scop == '.') {
-                    sbScop.setCharAt(i, ',');
-                    sbAf.insert(i, '=');
-                    sbAln.insert(i, ' ');
-                }
-            }
-
-            // hetatm
-            else if (Character.isLetter(c_raf) && !Character.isLetter(c_scop)) {
-                if (c_scop == '=') {
-                    sbScop.setCharAt(i, '?');
-                } else if (c_scop == '.') {
-                    sbScop.setCharAt(i, '?');
-                    sbAf.insert(i, '=');
-                    sbAln.insert(i, ' ');
-                }
-            }
-
-            // insertion
-            else if (c_raf == '/') {
-                if (c_scop == '=') {
-                    sbScop.setCharAt(i, ',');
-                } else if (c_scop == '.') {
-                    sbScop.setCharAt(i, ',');
-                    sbAf.insert(i, '=');
-                    sbAln.insert(i, ' ');
-                }
-            }
-        }
-
-        for (int i = 0; i < sbAf.length(); i++) {
-            char c_af = sbAf.charAt(i);
-            char c_scop = sbScop.charAt(i);
-
-            if (c_af != '=') {
-                idx_af++;
-            }
-            if (c_scop != '=') {
-                idx_raf++;
-            }
-        }
-
-        // end gap
-        String af_suffix = "";
-        String aln_suffix = "";
-        String scop_suffix = "";
-
-        // idx_af is up-to-date
-        // idx_raf is up-to-date
-
-        int dist_to_af_end = af_len - idx_af + 1;
-        int dist_to_scop_end = rafMapArray.length - idx_raf;
-
-        // extend both until one finishes
-        while (dist_to_af_end > 0 && dist_to_scop_end > 0) {
-            af_suffix += "E";
-            aln_suffix += " ";
-            scop_suffix += rafMapArray[idx_raf].toUpperCase();
-            dist_to_af_end--;
-            dist_to_scop_end--;
-            idx_raf++;
-        }
-
-        // extend just scop until done
-        while (dist_to_af_end == 0 && dist_to_scop_end > 0) {
-            af_suffix += "=";
-            aln_suffix += " ";
-            scop_suffix += rafMapArray[idx_raf].toUpperCase();
-            dist_to_scop_end--;
-            idx_raf++;
-        }
-
-        // extend just af until done
-        while (dist_to_af_end > 0 && dist_to_scop_end == 0) {
-            af_suffix += "E";
-            aln_suffix += " ";
-            scop_suffix += "=";
-            dist_to_af_end--;
-        }
-
-        this.afSeq = af_prefix + sbAf.toString() + af_suffix;
-        this.alnSeq = aln_prefix + sbAln.toString() + aln_suffix;
-        this.scopSeq = scop_prefix + sbScop.toString() + scop_suffix;
-
-        logger.info(afSeq);
-        logger.info(alnSeq);
-        logger.info(scopSeq);
-        
-    }
-
-    /*
-    parse NEW gaps
-     */
-    public void parseGaps() throws Exception {
-
-        logger.info("parseGaps");
-
-        // initialize new seqs
-        constructNewSeqs();
-
-        // parse through the new gaps //
-        Gap g_af = null;
-        Gap g_scop = null;
-        int currType = 0;
-        int currID = 1;
-        int af_index = 0;
-        int scop_index = fcs.scop_beginning - 1;
-
-        // process all gaps
-        for (int i = 0; i <= this.afSeq.length(); i++) {
-            if (i == this.afSeq.length()) {
-                if (g_af != null && g_scop != null) {
-                    g_af.setEnd("af");
-                    g_scop.setEnd("scop");
-                }
-                break;
-            }
-
-            char c_af = afSeq.charAt(i);
-            char c_aln = alnSeq.charAt(i);
-            char c_scop = scopSeq.charAt(i);
-
-            if (c_scop != '=' && c_scop != '/') { scop_index++; }
-            if (c_af != '=') { af_index++; }
-
-            // if in a gap
-            if (c_aln != '1') {
-                int newType = gapType(c_af, c_scop);
-
-                // if you weren't in a gap before, make a new gap here.
-                if (g_af == null && g_scop == null) {
-                    currType = newType;
-                    g_af = new Gap(af_index, currID, currType);
-                    g_scop = new Gap(scop_index, currID, currType);
-                }
-
-                // if you were in a gap before and you're still in the same type of gap -> extend.
-                // if you were in a gap before and you're in a new type of gap now -> end the current gap. make a new gap.
-                else if (g_af != null && g_scop != null && currType != newType) {
-                    g_af.setEnd("af");
-                    g_scop.setEnd("scop");
-                    currType = newType;
-                    g_af = new Gap(af_index, currID, currType);
-                    g_scop = new Gap(scop_index, currID, currType);
-                }
-
-                // based on type, extend.
-                g_af.extend("af");
-                g_scop.extend("scop");
-
-            } else if (c_aln == '1') {
-
-                // if you were in a gap and it ended, end the current gap. set gaps as null.
-                if (g_af != null && g_scop != null) {
-                    g_af.setEnd("af");
-                    g_scop.setEnd("scop");
-                    g_af = null;
-                    g_scop = null;
-                    currType = 0;
-                    currID++;
-                }
-
-                // if you weren't in a gap before, just advance the index pointers.
-            }
-        }
-    }
-
-    /*
-    returns the gap type given scopSeq and afSeq characters
-     */
-    public int gapType(char c_af, char c_scop) throws Exception {
-
-        boolean hasAF = false;
-        boolean hasSCOP = false;
-        boolean missing = false;
-        boolean hetatm = false;
-        boolean insertion = false;
-
-        if (c_af != '=') {
-            hasAF = true;
-        }
-        if (c_scop != '=') {
-            hasSCOP = true;
-            if (c_scop == ',') {
-                missing = true;
-            } else if (c_scop == '?') {
-                hetatm = true;
-            } else if (c_scop == '/') {
-                insertion = true;
-            }
-        }
-
-        if (hasAF && !hasSCOP) {
-            return 1;
-        } else if (hasAF && hasSCOP) {
-            if (missing) {
-                return 7;
-            } else if (hetatm) {
-                return 5;
-            } else if (insertion) {
-                return 9;
-            } else {
-                return 3;
-            }
-        } else if (!hasAF && hasSCOP) {
-            if (missing) {
-                return 6;
-            } else if (hetatm) {
-                return 4;
-            } else if (insertion) {
-                return 8;
-            } else {
-                return 2;
-            }
-        }
-        throw new Exception ("type not found for " + this.query + " x " + this.scopFile);
-    }
-
-    /*
-    compare fatcatSeq to rafMap, parse ranges of missing residues and post-translational modifications
-     */
-    public String getRafSeq() throws Exception {
-
-        logger.info("getRafSeq");
-
-        // convert rafMap to rafSeq string
-        boolean withinRange = false;
-        StringBuilder result = new StringBuilder();
-
-        for (Map.Entry<String, String> entry : fcs.rafMap.entrySet()) {
-            String key = entry.getKey();
-            if (shortMatch) {
-                withinRange = true;
-            }
-            if (key.equals(String.valueOf(this.scop_start))) {
-                withinRange = true;
-            }
-            if (withinRange) {
-                result.append(entry.getValue());
-            }
-            if (key.equals(String.valueOf(this.scop_start_index + scop_length))) { // questionable -1
-                withinRange = false;
-            }
-        }
-        this.rafSeq = result.toString().toUpperCase();
-        return rafSeq;
-    }
-
 
     public void clearTemp() throws Exception {
         FileUtils.cleanDirectory(new File(TEMP_DIR));
@@ -1205,125 +738,61 @@ public class FatcatPair {
         return null;
     }
 
-    /*
-    Helper class that contains the starts, ends, and lengths for each Gap.
-     */
-    public class Gap {
-
-        int start;
-        int end;
-        int len;
-        int gap_id;
-        int gap_type;
-        int num_insertions;
-
-        ArrayList<Integer> af_types = new ArrayList<>(Arrays.asList(1, 3, 5, 7, 9)); // gap_types where af should be extended
-        ArrayList<Integer> scop_types = new ArrayList<>(Arrays.asList(2, 3, 4, 5, 6, 7, 8, 9)); // gap_types where scop should be extended
-
-        public Gap(int start, int gap_id) {
-            this.start = start;
-            this.end = -1;
-            this.len = 0;
-            this.gap_id = gap_id;
-            this.gap_type = -1;
+    /** scop_node_fatcat_af_gap_type id for a gap type of
+     *  ChainDomainRafPositions (model in the place of the chain).  A model
+     *  has no unobserved residues or residues of unknown type. */
+    static int afGapType(int type) throws Exception {
+        switch (type) {
+            case 1: return 1;    // AlphaFold only
+            case 2: return 2;    // SCOP domain only
+            case 3: return 3;    // both
+            case 6: return 4;    // domain residue of unknown type, domain only
+            case 7: return 5;    // domain residue of unknown type, both
+            case 10: return 6;   // unobserved domain residue, domain only
+            case 11: return 7;   // unobserved domain residue, both
         }
-
-        public Gap(int start, int end, int gap_id, int gap_type) {
-            this.start = start;
-            this.end = end;
-            this.len = end - start;
-            this.gap_id = gap_id;
-            this.gap_type = gap_type;
-        }
-
-        public Gap(int start, int gap_id, int gap_type) {
-            this.start = start;
-            this.end = -1;
-            this.len = 0;
-            this.gap_id = gap_id;
-            this.gap_type = gap_type;
-            this.num_insertions = 0;
-        }
-
-        public void setEnd(String gap) {
-            this.end = this.start + this.len;
-            if (gap == "af") {
-                if (this.len == 0 && this.start == af_len) {
-                    this.start++;
-                }
-                queryGaps.add(this);
-            } else if (gap == "scop") {
-                if (this.len == 0 && this.start == fcs.actual_scop_len) {
-                    this.start++;
-                }
-                hitGaps.add(this);
-            }
-        }
-
-        public void addInsertion() {
-            this.num_insertions++;
-        }
-
-        public void extend(String gap) {
-            if ((gap == "af" && af_types.contains(this.gap_type)) || (gap == "scop" && scop_types.contains(this.gap_type))) {
-                this.len++;
-            }
-        }
-
-        public void setType(int gap_type) {
-            this.gap_type = gap_type;
-        }
-
-        @Override
-        public String toString() {
-            return "[" + start + ", " + end + "] " + gap_type;
-        }
-
+        throw new Exception("gap type " + type + " cannot occur for a model");
     }
 
-    public void printEverything() throws Exception {
+    /** RAF-style body for a model: one record per residue of the file, all
+     *  observed, so that position i is residue number i + 1. */
+    static String modelRafBody(ArrayList<String[]> residues) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < residues.size(); i++) {
+            String[] r = residues.get(i);
+            if (!r[0].equals(String.valueOf(i + 1)))
+                throw new Exception("model residues are not numbered 1..N (residue " + r[0] + " at position " + (i + 1) + ")");
+            char c = Character.toLowerCase(r[1].charAt(0));
+            sb.append(String.format("%4s %c%c", r[0], c, c));
+        }
+        return sb.toString();
+    }
 
-        System.out.println("af_len: " + af_len);
-        System.out.println("scop_len: " + scop_len);
-        System.out.println("ini_len: " + ini_len);
-        System.out.println("ini_rmsd: " + ini_rmsd);
-        System.out.println("opt_equ: " + opt_equ);
-        System.out.println("opt_rmsd: " + opt_rmsd);
-        System.out.println("chain_rmsd: " + chain_rmsd);
-        System.out.println("score: " + score);
-        System.out.println("align_len: " + align_len);
-        System.out.println("gaps: " + gaps);
-        System.out.println("p_val: " + p_val);
-        System.out.println("afp_num: " + afp_num);
-        System.out.println("identity: " + identity);
-        System.out.println("similarity: " + similarity);
-        System.out.println("af_start: " + af_start);
-        System.out.println("af_length: " + af_length);
-        System.out.println("scop_start: " + scop_start);
-        System.out.println("scop_length: " + scop_length);
-        System.out.println("rotLst: " + Arrays.deepToString(rotLst));
-        System.out.println("transLst: " + Arrays.toString(transLst));
-
-        System.out.println("constructNewSeqs:");
-        System.out.println(this.afSeq);
-        System.out.println(this.alnSeq);
-        System.out.println(this.scopSeq);
-
-        System.out.println(fcs.rafMap);
-
-        // System.out.println("astralSeqs:");
-        // System.out.println("astralSeqATOM:   " + fcs.astralSeqATOM);
-        // System.out.println("astralSeqSEQRES: " + fcs.astralSeqSEQRES);
-
-
+    /** Derive the positions and gaps of a retained hit from the .aln rows
+     *  and the RAF of the domain, as ChainDomainFatcatPair does for chains. */
+    public void deriveRafPositions() throws Exception {
+        rafPositions = null;
+        if (shortMatch || !shouldStoreDetail()) return;
+        java.util.List<String> lines = Files.readAllLines(Paths.get(fcs.TempDir + this.alignmentFile),
+                                                          java.nio.charset.StandardCharsets.ISO_8859_1);
+        ArrayList<ChainDomainRafPositions.Row> rows = ChainDomainRafPositions.parseAln(lines, new boolean[1]);
+        ArrayList<String[]> modelRes = ChainDomainRafPositions.fileResidues(Paths.get(this.afFile));
+        if (fcs.domainResidues == null)
+            fcs.domainResidues = ChainDomainRafPositions.fileResidues(Paths.get(this.scopFile));
+        int[] range = ChainDomainRafPositions.domainRange(fcs.rafBody, fcs.domainDescription);
+        rafPositions = ChainDomainRafPositions.derive(modelRafBody(modelRes), modelRes, fcs.rafBody,
+                                                      fcs.domainResidues, range[0], range[1], rows);
+        int mismatches = rafPositions.chainMismatches + rafPositions.domainMismatches;
+        if (mismatches > 0)
+            throw new Exception(mismatches + " residue letters of the FATCAT alignment of " +
+                                this.query + " x " + this.hit + " disagree with the structure files");
     }
 
     public void runComparison() throws Exception {
         
         this.compare();
-        this.parseGaps();
+        this.deriveRafPositions();
         this.archiveAndClear();
-        // this.storeData();
         this.storeSQL();
         
     }

@@ -31,6 +31,15 @@ public class ChainDomainFatcatPairs {
     public HashSet<Integer> completedNodes = new HashSet<>();
     // nodes completed by this run -> retained; legacy nodes are never archived
     public HashMap<Integer, Boolean> runCompletedNodes = new HashMap<>();
+    // entry names of the existing segment archives (loaded instead of
+    // unpacking them); new output is merged into the archives at the end
+    public HashSet<String> archivedAlnNames = new HashSet<>();
+    // legacy hit rows of this chain (not produced by this run): node -> hit id.
+    // They are recomputed under this run's conventions and replaced.
+    public HashMap<Integer, Integer> legacyHitIds = new HashMap<>();
+    // residues of the chain file as FATCAT sees them (filled on first use)
+    public ArrayList<String[]> chainResidues = null;
+    public HashSet<String> archivedMatNames = new HashSet<>();
 
     public String chain; // 1u5ta
     public String chainFile; // path to the chain file
@@ -328,56 +337,26 @@ public class ChainDomainFatcatPairs {
     }
 
     public void zipDirs() throws Exception {
-
         logger.info("zipping");
-
-        String zipPath = null;
-        String destPath = null;
-
         for (int i = 0; i < 2; i++) {
-            if (i == 0) {
-                zipPath = this.zipPathAln;
-                destPath = this.destPathAln;
-            } else if (i == 1) {
-                zipPath = this.zipPathMat;
-                destPath = this.destPathMat;
-            } else {
-                break;
+            Path zipFile = Paths.get(i == 0 ? this.zipPathAln : this.zipPathMat);
+            Path destDir = Paths.get(i == 0 ? this.destPathAln : this.destPathMat);
+            if (!Files.exists(destDir)) continue;
+            boolean hasFiles;
+            try (java.util.stream.Stream<Path> st = Files.walk(destDir)) {
+                hasFiles = st.anyMatch(p -> !Files.isDirectory(p) &&
+                                       !p.toString().toLowerCase().endsWith(".zip"));
             }
-
-            if (!Files.exists(Paths.get(zipPath))) {
-                Path zipFile = createFile(Paths.get(zipPath), "zip output");
-                try (ZipOutputStream zs = new ZipOutputStream(Files.newOutputStream(zipFile))) {
-                    Path sourceDir = Paths.get(destPath);
-                    Files.walk(sourceDir)
-                            .filter(path -> !Files.isDirectory(path))
-                            .filter(path -> !path.toString().toLowerCase().endsWith(".zip"))
-                            .forEach(path -> {
-                                ZipEntry zipEntry = new ZipEntry(sourceDir.relativize(path).toString());
-                                try {
-                                    zs.putNextEntry(zipEntry);
-                                    Files.copy(path, zs);
-                                    zs.closeEntry();
-                                } catch (IOException e) {
-                                    System.err.println("Failed to zip file: " + path);
-                                    throw new RuntimeException(e);
-                                }
-                            });
-                }
-            }
-            Path destDir = Paths.get(destPath);
-            if (Files.exists(destDir)) {
-                Files.walk(destDir)
-                        .sorted(Comparator.reverseOrder())
-                        .forEach(path -> {
-                            try {
-                                Files.delete(path);
-                            } catch (IOException e) {
-                                throw new UncheckedIOException("Failed to delete " + path, e);
-                            }
-                        });
-            }
-
+            if (hasFiles) mergeDirIntoArchive(zipFile, destDir);
+            Files.walk(destDir)
+                    .sorted(Comparator.reverseOrder())
+                    .forEach(path -> {
+                        try {
+                            Files.delete(path);
+                        } catch (IOException e) {
+                            throw new UncheckedIOException("Failed to delete " + path, e);
+                        }
+                    });
         }
     }
 
@@ -434,10 +413,25 @@ public class ChainDomainFatcatPairs {
         }
     }
 
+    /** Whether every entry of an archive can be extracted.  Opening the
+     *  archive as a ZipFile only reads the central directory, so a zip whose
+     *  entries are truncated or misplaced (e.g. 9gekA-0.aln.zip after the
+     *  file server crash) passed that test and then failed in unzipDirs,
+     *  outside the per-comparison error handling.  Stream through every
+     *  entry and require the count to match the central directory. */
     public static boolean isReadableArchive(Path zipPath) {
-        try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(zipPath.toFile())) {
-            return true;
-        } catch (IOException e) {
+        byte[] buf = new byte[65536];
+        try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(zipPath.toFile());
+             java.util.zip.ZipInputStream zis =
+                 new java.util.zip.ZipInputStream(Files.newInputStream(zipPath))) {
+            int n = 0;
+            while (zis.getNextEntry() != null) {
+                while (zis.read(buf) != -1) { }
+                zis.closeEntry();
+                n++;
+            }
+            return n == z.size();
+        } catch (Exception e) {
             return false;
         }
     }
@@ -456,8 +450,78 @@ public class ChainDomainFatcatPairs {
     /** Whether a completed comparison's output is in the unzipped archive. */
     private boolean isArchived(String domain, boolean retained) {
         String prefix = this.chain + "-" + domain;
-        return Files.exists(Paths.get(this.AlnDir + prefix + ".aln")) &&
-            (!retained || Files.exists(Paths.get(this.MatrixDir + prefix + ".matrix")));
+        // Consult the archive index first; a file-system stat over NFS for
+        // each of the ~4,800 nodes of a segment costs about 20 s.
+        if (!archivedAlnNames.contains(prefix + ".aln") &&
+            !Files.exists(Paths.get(this.AlnDir + prefix + ".aln")))
+            return false;
+        if (!retained) return true;
+        return archivedMatNames.contains(prefix + ".matrix") ||
+            Files.exists(Paths.get(this.MatrixDir + prefix + ".matrix"));
+    }
+
+    /** Record the entry names of the existing segment archives so completed
+     *  comparisons can be recognised without unpacking them. */
+    public void loadArchiveIndex() throws IOException {
+        archivedAlnNames.clear();
+        archivedMatNames.clear();
+        for (int i = 0; i < 2; i++) {
+            Path zipFile = Paths.get(i == 0 ? this.zipPathAln : this.zipPathMat);
+            if (!Files.exists(zipFile)) continue;
+            HashSet<String> names = (i == 0 ? archivedAlnNames : archivedMatNames);
+            try (java.util.zip.ZipFile z = new java.util.zip.ZipFile(zipFile.toFile())) {
+                java.util.Enumeration<? extends ZipEntry> en = z.entries();
+                while (en.hasMoreElements()) {
+                    ZipEntry e = en.nextElement();
+                    if (!e.isDirectory()) names.add(e.getName());
+                }
+            }
+        }
+        logger.info("archive index: " + archivedAlnNames.size() + " alignments, " +
+                    archivedMatNames.size() + " matrices");
+    }
+
+    private static void copyStream(InputStream in, OutputStream out) throws IOException {
+        byte[] buf = new byte[65536];
+        int n;
+        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+    }
+
+    /** Add every file under dir to the archive, replacing entries of the
+     *  same name, by streaming the old archive into a new file that is then
+     *  renamed into place.  Nothing is unpacked, so a retry that adds a few
+     *  alignments to a 5,000-entry archive costs seconds, not minutes. */
+    private void mergeDirIntoArchive(Path zipFile, Path dir) throws IOException {
+        List<Path> files = new ArrayList<>();
+        try (java.util.stream.Stream<Path> st = Files.walk(dir)) {
+            st.filter(p -> !Files.isDirectory(p))
+              .filter(p -> !p.toString().toLowerCase().endsWith(".zip"))
+              .forEach(files::add);
+        }
+        HashSet<String> newNames = new HashSet<>();
+        for (Path f : files) newNames.add(dir.relativize(f).toString());
+        Path tmp = zipFile.resolveSibling(zipFile.getFileName().toString() + ".merge.tmp");
+        Files.deleteIfExists(tmp);
+        try (ZipOutputStream zs = new ZipOutputStream(Files.newOutputStream(tmp))) {
+            if (Files.exists(zipFile)) {
+                try (java.util.zip.ZipFile old = new java.util.zip.ZipFile(zipFile.toFile())) {
+                    java.util.Enumeration<? extends ZipEntry> en = old.entries();
+                    while (en.hasMoreElements()) {
+                        ZipEntry e = en.nextElement();
+                        if (e.isDirectory() || newNames.contains(e.getName())) continue;
+                        zs.putNextEntry(new ZipEntry(e.getName()));
+                        try (InputStream in = old.getInputStream(e)) { copyStream(in, zs); }
+                        zs.closeEntry();
+                    }
+                }
+            }
+            for (Path f : files) {
+                zs.putNextEntry(new ZipEntry(dir.relativize(f).toString()));
+                Files.copy(f, zs);
+                zs.closeEntry();
+            }
+        }
+        Files.move(tmp, zipFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     public static void getDomains() throws Exception {
@@ -583,7 +647,7 @@ public class ChainDomainFatcatPairs {
         }
         if (run_id>0) {
             discardUnreadableArchives();
-            unzipDirs();
+            loadArchiveIndex();
         }
 
         int commit_interval = 250;
@@ -616,9 +680,13 @@ public class ChainDomainFatcatPairs {
                 // recomputed for the archive only; its results are already
                 // in the database.
                 boolean archiveOnly = false;
+                Boolean recorded = null;
                 if (run_id>0 && completedNodes.contains(node_id)) {
-                    Boolean retained = runCompletedNodes.get(node_id);
-                    if (retained==null || isArchived(domains.get(node_id), retained))
+                    recorded = runCompletedNodes.get(node_id);
+                    // A legacy retained hit (in scop_node_fatcat_chain but
+                    // not in the completion table) keeps its statistics;
+                    // only its alignment is rebuilt for the archive.
+                    if (isArchived(domains.get(node_id), recorded==null || recorded))
                         continue;
                     archiveOnly = true;
                 }
@@ -634,8 +702,10 @@ public class ChainDomainFatcatPairs {
                     fc.runComparison(!archiveOnly);
                     if (archiveOnly) {
                         num_rebuilt++;
-                        if (fc.isRetained() != runCompletedNodes.get(node_id))
+                        boolean expected = (recorded==null || recorded);
+                        if (fc.isRetained() != expected)
                             logger.warning("rebuilt comparison for node " + node_id + " " + domains.get(node_id) +
+                                           (recorded==null ? " (legacy retained hit)" : "") +
                                            " disagrees with recorded retention status");
                     }
 
@@ -847,7 +917,8 @@ public class ChainDomainFatcatPairs {
 
     private void loadCompleted() throws Exception {
         Statement stmt=LocalSQL.createStatement();
-        ResultSet rs=stmt.executeQuery("select node_id,status from " +
+        HashSet<Integer> runResultIds=new HashSet<>();
+        ResultSet rs=stmt.executeQuery("select node_id,status,result_id from " +
             "scop_node_fatcat_chain_completion where run_id="+run_id+
             " and chain_id="+chain_id+
             " and status in ('complete_retained','complete_rejected')");
@@ -855,17 +926,24 @@ public class ChainDomainFatcatPairs {
             completedNodes.add(rs.getInt(1));
             runCompletedNodes.put(rs.getInt(1),
                                   rs.getString(2).equals("complete_retained"));
+            int resultId=rs.getInt(3);
+            if (!rs.wasNull()) runResultIds.add(resultId);
         }
         rs.close();
-        // Legacy retained hits remain authoritative and must not be recomputed.
-        // Low-quality legacy rows are intentionally absent after shadow swap;
-        // partial chains will therefore create compact rejected-completion rows
-        // only for work that still needs to be represented.
-        rs=stmt.executeQuery("select domain_id from scop_node_fatcat_chain where "+
-            "chain_id="+chain_id+" and p_val is not null and p_val<=0.05 and "+
-            "ini_rmsd is not null and ini_rmsd<4");
-        while (rs.next()) completedNodes.add(rs.getInt(1));
+        // Hit rows of this chain that this run did not produce come from the
+        // April-July legacy run, whose chain files differed (they carried
+        // HETATM modified residues).  Decided 2026-11-06: recompute them
+        // under this run's conventions; storeSQL deletes the legacy row and
+        // its gap and matrix rows in the same manifest as the replacement.
+        rs=stmt.executeQuery("select id,domain_id from scop_node_fatcat_chain "+
+            "where chain_id="+chain_id);
+        while (rs.next()) {
+            if (runResultIds.contains(rs.getInt(1))) continue;
+            legacyHitIds.put(rs.getInt(2), rs.getInt(1));
+        }
         rs.close(); stmt.close();
+        if (legacyHitIds.size()>0)
+            logger.info(legacyHitIds.size()+" legacy hit rows to recompute");
     }
 
     public static void runComparisons(int targetID, int segmentID) throws Exception {

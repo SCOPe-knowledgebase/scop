@@ -57,6 +57,9 @@ public class FatcatPairs {
     public String zipPathMat;
 
     public Path tempDomain;
+    public String rafBody;             // RAF body of the domain's chain
+    public String domainDescription;   // scop_node.description, e.g. "1hqc A:243-318"
+    public ArrayList<String[]> domainResidues;   // residues of the domain file, read once
     public String scopHash;
     public String subdir;
     public Path logFile;
@@ -103,7 +106,7 @@ public class FatcatPairs {
         int rafVersion = -1;
         this.scop_beginning = 1;
         Statement stmtRAF = LocalSQL.createStatement();
-        ResultSet rsRAF = stmtRAF.executeQuery("select raf.raf_version_id, raf.line from raf\n" +
+        ResultSet rsRAF = stmtRAF.executeQuery("select raf.raf_version_id, raf.line, scop_node.description from raf\n" +
                 "join pdb_chain on raf.pdb_chain_id = pdb_chain.id\n" +
                 "join link_pdb on pdb_chain.id = link_pdb.pdb_chain_id\n" +
                 "join scop_node on link_pdb.node_id = scop_node.id\n" +
@@ -117,6 +120,7 @@ public class FatcatPairs {
         boolean hasRsRAF = false;
         while (rsRAF.next()) {
             rafLine = rsRAF.getString("line");
+            this.domainDescription = rsRAF.getString("description");
             rafVersion = rsRAF.getInt("raf_version_id");
             hasRsRAF = true;
         }
@@ -128,6 +132,7 @@ public class FatcatPairs {
         this.rafStart = String.valueOf(rafHeader[5]);
         this.rafEnd = String.valueOf(rafHeader[6]);
         rafLine = rafLine.substring(38); // chop header
+        this.rafBody = rafLine;
         // 0-2 --> empty spaces or number
         // 3 --> index end
         // 4 --> insertion code (if applicable)
@@ -410,12 +415,13 @@ public class FatcatPairs {
                     logger.info("re-initializing stmts");
                     LocalSQL.connectRW();
                     stmt1 = LocalSQL.prepareStatement(
-                            "INSERT INTO scop_node_fatcat_af " +
-                                    "VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO scop_node_fatcat_af (af_id, node_id, af_len, scop_len, ini_len, ini_rmsd, opt_equ, opt_rmsd, " +
+                                    "chain_rmsd, score, align_len, gaps, p_val, afp_num, identity, similarity, af_start, af_length, " +
+                                    "domain_start, domain_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             Statement.RETURN_GENERATED_KEYS
                     );
                     stmt2 = LocalSQL.prepareStatement(
-                            "INSERT INTO scop_node_fatcat_af_gap (hit_id, gap_start_af, gap_length_af, gap_start_scop, gap_length_scop, gap_id, gap_type) " +
+                            "INSERT INTO scop_node_fatcat_af_gap (hit_id, gap_id, gap_type, gap_start_af, gap_end_af, gap_start_domain, gap_end_domain) " +
                                     "VALUES (?,?,?,?,?,?,?)"
                     );
                     stmt3 = LocalSQL.prepareStatement(
