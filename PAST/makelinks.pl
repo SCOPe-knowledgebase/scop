@@ -1,8 +1,8 @@
-#!/usr/bin/perl
+#!/lab/bin/perl
 #
 #   makelinks.pl - remaking links from a pruned directory.
 #
-#   Copyright (C) 2001-2021 Degui Zhi and John-Marc Chandonia
+#   Copyright (C) 2001-2026 Degui Zhi and John-Marc Chandonia
 #
 #   This program is free software; you can redistribute it and/or modify it
 #   under the terms of the GNU General Public License as published by the
@@ -31,6 +31,13 @@
 # arguments:  the directory to remake, and the previous snapshot,
 # which must not have been pruned.  If the previous snapshot
 # was pruned, you have to run this program on it first.
+#
+# A snapshot that has a manifest (files/MANIFEST.tsv, written by
+# snapshot.pl of PAST 2.0) is remade from the manifest alone; the
+# previous snapshot is then not needed and may be left out.
+#
+# The root is taken from the environment variable PAST_ROOT, or the
+# default below.
 
 use strict;
 use Net::FTP;
@@ -38,7 +45,7 @@ use Net::FTP;
 # ################## config here ########################
 
 # where is pdb directory on this machine?
-my $root = "/lab/db/pdb";
+my $root = defined $ENV{PAST_ROOT} ? $ENV{PAST_ROOT} : "/lab/db/pdb";
 
 # needs space on temp directory
 my $tmpDir = "/tmp";
@@ -56,8 +63,15 @@ my %month2num = qw(
     );
 
 sub processLSLR;
+sub fromManifest;
 
 MAIN : {
+    if (($#ARGV == 0 || $#ARGV == 1) && $ARGV[0] =~ /^[0-9]{6}$/ &&
+	-f "$root/data/$ARGV[0]/files/MANIFEST.tsv") {
+	fromManifest($ARGV[0]);
+	exit(0);
+    }
+
     if ($#ARGV != 1) {
 	die("syntax:  makelinks.pl snapshot previous-snapshot\n");
     }
@@ -88,8 +102,8 @@ MAIN : {
 	die("snapshot '$newdir' doesn't seemed to have been pruned.\n");
     }
 
-    if (! -w $newdir) {
-	die("you aren't supposed to makelinks on '$newdir'.\n");
+    if (frozen($newdir)) {
+	die("snapshot '$newdir' is frozen (read-only); its links are never remade.\n");
     }
 
     # what are our current files?
@@ -253,6 +267,15 @@ MAIN : {
 # values are mod dates.
 # hashes 8-14 are the same, but with noc files.
 # there are no bundles with noc files, but the code assumes there might be
+# A snapshot whose directory is not writable by its owner is frozen (it is
+# the freeze of a SCOP/SCOPe release) and is never changed, whoever runs
+# this; -w alone would let root through.
+sub frozen {
+    my ($d) = @_;
+    my @st = stat($d);
+    return (! @st) || (! ($st[2] & 0200)) || (! -w $d);
+}
+
 sub processLSLR {
     my ($lslr) = @_;
 
@@ -358,4 +381,80 @@ sub processLSLR {
 	}
     }
     return \@rv;
+}
+
+# Remakes the link tree of a snapshot from its manifest: one line per
+# file, tab-separated, first column the path below snapshot/, fourth
+# column the stored file below data/.  The last line gives the number
+# of rows.
+sub fromManifest {
+    my ($newdir) = @_;
+    my $dir = "$root/data/$newdir";
+    my $mf = "$dir/files/MANIFEST.tsv";
+
+    if (-e "$dir/snapshot") {
+	die("snapshot '$newdir' doesn't seemed to have been pruned.\n");
+    }
+    if (frozen($dir)) {
+	die("snapshot '$newdir' is frozen (read-only); its links are never remade.\n");
+    }
+
+    my (@rows, $count);
+    open(my $fh, '<', $mf) or die("can't read $mf: $!\n");
+    while (my $line = <$fh>) {
+	chomp($line);
+	if ($line =~ /^#/) {
+	    $count = $1 if ($line =~ /^#rows\t(\d+)$/);
+	    next;
+	}
+	my @f = split(/\t/, $line, -1);
+	if (@f < 4) {
+	    die("$mf line $.: not a manifest row\n");
+	}
+	push(@rows, [ $f[0], $f[3] ]);
+    }
+    close($fh);
+    if (! defined $count || $count != @rows) {
+	die("$mf is incomplete; nothing done.\n");
+    }
+
+    # build beside the final place, rename when done
+    my $tmp = "$dir/snapshot.tmp";
+    if (-e $tmp) {
+	die("$tmp exists; remove it first.\n");
+    }
+    my %made;
+    mkdir($tmp, 0755) or die("can't make $tmp: $!\n");
+    foreach my $sub (qw(hash obs-hash cif-hash cif-obs-hash xml-hash xml-obs-hash
+			bundle-hash all obs-all cif-all cif-obs-all xml-all
+			xml-obs-all bundle-all)) {
+	mkdir("$tmp/$sub", 0755) or die("can't make $tmp/$sub: $!\n");
+	$made{$sub} = 1;
+    }
+    foreach my $r (@rows) {
+	my ($path, $storage) = @$r;
+	next if ($path =~ /^(seq|index)\//);
+	if ($path !~ /^((?:[a-z]+-)*)hash\/([a-z0-9]{2})\/([^\/]+)$/) {
+	    die("$mf: unexpected path $path\n");
+	}
+	my ($pre, $hh, $name) = ($1, $2, $3);
+	if ($storage !~ /^[0-9]{6}\/files\/[^\/]+\/[^\/]+\/[^\/]+$/) {
+	    die("$mf: unexpected storage path $storage\n");
+	}
+	if (! $made{"${pre}hash/$hh"}) {
+	    mkdir("$tmp/${pre}hash/$hh", 0755) or die("can't make $tmp/${pre}hash/$hh: $!\n");
+	    $made{"${pre}hash/$hh"} = 1;
+	}
+	symlink("../../../../$storage", "$tmp/${pre}hash/$hh/$name")
+	    or die("can't make link for $path: $!\n");
+	symlink("../${pre}hash/$hh/$name", "$tmp/${pre}all/$name")
+	    or die("can't make link for $path: $!\n");
+    }
+    if (-e "$dir/files/seq") {
+	symlink("../files/seq", "$tmp/seq") or die("can't make link seq: $!\n");
+    }
+    if (-e "$dir/files/index") {
+	symlink("../files/index", "$tmp/index") or die("can't make link index: $!\n");
+    }
+    rename($tmp, "$dir/snapshot") or die("can't rename $tmp: $!\n");
 }

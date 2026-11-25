@@ -1,0 +1,130 @@
+Testing PAST
+============
+
+    t/run
+
+runs the whole harness (a few minutes).  It syntax-checks snapshot.pl,
+prune.pl and makelinks.pl, then runs t/harness.pl, which
+
+  - builds a fake wwPDB site (holdings files, small gzip files, an index
+    listing with relative links, a sequence file, an on-hold file) and
+    serves it with t/mockserver.py on a free port of 127.0.0.1;
+  - builds an empty archive root;
+  - runs snapshot.pl, prune.pl and makelinks.pl against them, with standard input not
+    a terminal, and checks the results.
+
+Nothing outside the work directory is read or written, and no request
+leaves the machine.  The output is TAP: one "ok" line per case, with the
+individual checks indented below it.  The exit status is 0 only if every
+check passed.
+
+Needs: perl (with the modules snapshot.pl needs, and Test::More,
+IO::Compress::Gzip, JSON::PP), python3 (standard library only), gzip and
+timeout in the path.
+
+Environment:
+
+    PERL             perl to use (default /lab/bin/perl, else perl)
+    PAST_TEST_TMP    where to make the work directory (default: system tmp)
+    PAST_TEST_KEEP   set to keep the work directory afterwards
+    PAST_TEST_SHOW   set to print the output of every snapshot.pl run
+    PAST_SNAPSHOT, PAST_PRUNE, PAST_MAKELINKS   test other copies of the scripts
+
+snapshot.pl runs with its default guards and limits; a case passes an
+option only where it is about that option, or where the tiny site
+would trip a fraction (one entry of twelve is 8%).
+
+Cases (50; t/harness.pl has the details):
+
+  start        latest missing without --init; --init with a failing
+               guard (nothing created, not even data/); first run;
+               same-day rerun; --init on an archive with snapshots;
+               a first run that failed, run again with --init and with
+               --init --fresh; --adopt when the first run published
+               but there is no "latest"
+  identity     nothing changed; changed content; Last-Modified changed
+               only; multipart ETag; same content compressed
+               differently; weak ETag, empty ETag, no Content-Length;
+               32-hex ETag that is not the MD5 and --etag-not-md5
+  downloads    truncated body; corrupt gzip; no Last-Modified; 404 with
+               bounded retries; --max-failures; --max-changed;
+               --max-hours; --max-compared; a one-part multipart ETag
+               that the download does not give; a two-part one that
+               cannot be checked (accepted and counted)
+  guards       unparseable date; no pdb key; collapsed count; deletions;
+               candidates; a kind that had no files; entry listed
+               nowhere; entry that lost its PDB-format file (not written
+               to "removed"); entry that becomes obsolete
+  reruns       same day and next day, files and HEAD answers kept;
+               SIGKILL; SIGTERM and SIGINT; lock held; more than one
+               staging directory; --fresh; finished snapshot newer than
+               latest and --adopt; output to a closed pipe; a space in
+               the root and temporary directory names; a staged file
+               with a multipart ETag that was changed after it was
+               fetched (fetched again), one that was not (kept), one
+               with a weak ETag (fetched again)
+  coming back  a removed entry listed again, recognised from
+               REMOVED.tsv and from an old-style "removed" list, linked
+               to the archived copy; a REMOVED.tsv with a bad storage
+               column
+  damage       archived file missing (one: repaired with the recorded
+               modification time; many: stop; unreadable: error);
+               manifest with a wrong size and empty file with
+               --refetch; truncated file with --refetch (replaced);
+               file with other content of the recorded size: found by
+               --manifest-only --verify, by a run with --verify and
+               when it is downloaded to compare, replaced with
+               --refetch; --refetch of a good file (kept)
+  other        index listing (relative links, missing name, a .gz name,
+               a clash); on-hold not FASTA; --dry-run and --list;
+               previous snapshot without a manifest; --manifest-only
+               (complete, build, resume, truncated archived file);
+               --check-all; --hash-reused; --verify on a good archive
+  makelinks.pl remakes a pruned tree identically from the manifest
+  frozen (read-only) snapshot: a later run links into it and leaves it
+    unchanged; prune.pl, makelinks.pl and --manifest-only refuse it
+  prune.pl     refuses latest, trailing slash, paths, "..", symlinks;
+               prunes an old snapshot
+
+Not covered by a test:
+
+  - the sync calls (files and directories), and anything about what
+    survives a power failure;
+  - a failing utime, unlink, rename or symlink (among them the checked
+    removal of stale lists from a resumed staging directory, and a
+    failure between publishing and switching "latest", which the --adopt
+    cases imitate by removing or moving the link afterwards);
+  - that the lock is taken before the archive is read: the lock case
+    only shows that a run stops while another holds the lock; two runs
+    racing are not tried, nor the first run in a new archive against
+    another first run;
+  - a real multipart ETag of more than one part: no test file is 8 MiB,
+    so the part sizes other than "one part" are not exercised;
+  - --refetch where the archived file is as recorded and the server's
+    file differs (stored as changed), where nothing is recorded for the
+    file, and for a file that comes back; a file whose MD5 is as
+    recorded and whose SHA-256 is not;
+  - --verify with a previous snapshot that has no manifest;
+    --manifest-only --verify together with --manifest-out, and on a
+    manifest with missing checksums;
+  - --max-compared with its default (100), and --check-all against a
+    server without usable ETags;
+  - frozen snapshots as root: the harness does not run as root, so the
+    refusal that does not rely on the permission check is tested only
+    with a snapshot whose top directory alone is read-only;
+  - the real wwPDB servers: every request in the harness goes to
+    t/mockserver.py.
+
+To try snapshot.pl by hand against the fake site, keep the work directory
+(PAST_TEST_KEEP=1), start the server yourself
+
+    python3 t/mockserver.py WORK/docroot WORK/control
+
+and pass --root WORK/root --source http://127.0.0.1:PORT/pub/pdb
+--onhold-url http://127.0.0.1:PORT/onhold --tmpdir WORK/tmp, where PORT
+is in WORK/control/port.
+
+A dry run against the real server reads the archive but writes nothing
+in it:
+
+    snapshot.pl --dry-run --list FILE
